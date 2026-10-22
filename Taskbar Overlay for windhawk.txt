@@ -40,11 +40,10 @@ static BOOL WINAPI GetMonitorInfoW_Hook(HMONITOR hMonitor, LPMONITORINFO lpmi) {
 }
 
 static BOOL WINAPI SystemParametersInfoW_Hook(UINT action, UINT param, PVOID pvParam, UINT winIni) {
-    // Spoof SPI_GETWORKAREA so Explorer's background timers don't panic
+    // 1. Spoof SPI_GETWORKAREA so background timers remain calm
     if (action == SPI_GETWORKAREA && pvParam && !g_unloading) {
         BOOL res = SystemParametersInfoW_Original(action, param, pvParam, winIni);
         if (res) {
-            // SPI_GETWORKAREA only applies to the primary monitor
             POINT pt = {0, 0};
             HMONITOR primary = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
             for (const auto& s : g_saved) {
@@ -57,21 +56,38 @@ static BOOL WINAPI SystemParametersInfoW_Hook(UINT action, UINT param, PVOID pvP
         return res;
     }
 
-    // Existing SPI_SETWORKAREA logic
+    // 2. Intercept and rewrite SPI_SETWORKAREA
     if (action == SPI_SETWORKAREA && pvParam && !g_unloading) {
         RECT* in = (RECT*)pvParam;
         HMONITOR mon = MonitorFromRect(in, MONITOR_DEFAULTTONEAREST);
         MONITORINFO mi = { sizeof(mi) };
         
-        // Check the real OS state using the original function
         if (GetMonitorInfoW_Original && GetMonitorInfoW_Original(mon, &mi)) {
+            
+            // DYNAMIC CACHE FIX: 
+            // If Explorer requests a work area smaller than the monitor, it is trying to 
+            // reserve taskbar space. We must update our saved spoof coordinates with this request.
+            if (!EqualRect(in, &mi.rcMonitor)) {
+                for (auto& s : g_saved) {
+                    if (s.monitor == mon) {
+                        s.originalWork = *in;
+                        break;
+                    }
+                }
+            }
+
+            // If the actual OS work area is already full, we just return TRUE to break the loop.
             if (EqualRect(&mi.rcWork, &mi.rcMonitor)) {
                 return TRUE;
             }
+            
+            // Otherwise, rewrite the request to full-screen.
             RECT full = mi.rcMonitor;
             return SystemParametersInfoW_Original(action, param, &full, winIni);
         }
     }
+    
+    // Pass through any other calls normally
     return SystemParametersInfoW_Original(action, param, pvParam, winIni);
 }
 
