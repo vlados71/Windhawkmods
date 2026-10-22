@@ -1,0 +1,142 @@
+// ==WindhawkMod==
+// @id            taskbar-overlay-workarea
+// @name          Taskbar Overlay by Vlad
+// @description   Makes maximized windows extend under the taskbar so a transparent taskbar draws over them
+// @version       0.4
+// @author        Vlad
+// @include       explorer.exe
+// ==/WindhawkMod==
+
+#include <windows.h>
+#include <vector>
+
+struct MonitorState {
+    HMONITOR monitor;
+    RECT originalWork;
+};
+
+static std::vector<MonitorState> g_saved;
+static volatile LONG g_unloading = 0;
+static HANDLE g_initThread = nullptr;
+
+typedef BOOL (WINAPI *SystemParametersInfoW_t)(UINT, UINT, PVOID, UINT);
+static SystemParametersInfoW_t SystemParametersInfoW_Original = nullptr;
+
+typedef BOOL (WINAPI *GetMonitorInfoW_t)(HMONITOR, LPMONITORINFO);
+static GetMonitorInfoW_t GetMonitorInfoW_Original = nullptr;
+
+// Spoofs the monitor info so Explorer thinks the taskbar space is still reserved, breaking the loop.
+static BOOL WINAPI GetMonitorInfoW_Hook(HMONITOR hMonitor, LPMONITORINFO lpmi) {
+    BOOL res = GetMonitorInfoW_Original(hMonitor, lpmi);
+    if (res && !g_unloading) {
+        for (const auto& s : g_saved) {
+            if (s.monitor == hMonitor) {
+                lpmi->rcWork = s.originalWork;
+                break;
+            }
+        }
+    }
+    return res;
+}
+
+static BOOL WINAPI SystemParametersInfoW_Hook(UINT action, UINT param, PVOID pvParam, UINT winIni) {
+    // Spoof SPI_GETWORKAREA so Explorer's background timers don't panic
+    if (action == SPI_GETWORKAREA && pvParam && !g_unloading) {
+        BOOL res = SystemParametersInfoW_Original(action, param, pvParam, winIni);
+        if (res) {
+            // SPI_GETWORKAREA only applies to the primary monitor
+            POINT pt = {0, 0};
+            HMONITOR primary = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
+            for (const auto& s : g_saved) {
+                if (s.monitor == primary) {
+                    *(RECT*)pvParam = s.originalWork;
+                    break;
+                }
+            }
+        }
+        return res;
+    }
+
+    // Existing SPI_SETWORKAREA logic
+    if (action == SPI_SETWORKAREA && pvParam && !g_unloading) {
+        RECT* in = (RECT*)pvParam;
+        HMONITOR mon = MonitorFromRect(in, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi = { sizeof(mi) };
+        
+        // Check the real OS state using the original function
+        if (GetMonitorInfoW_Original && GetMonitorInfoW_Original(mon, &mi)) {
+            if (EqualRect(&mi.rcWork, &mi.rcMonitor)) {
+                return TRUE;
+            }
+            RECT full = mi.rcMonitor;
+            return SystemParametersInfoW_Original(action, param, &full, winIni);
+        }
+    }
+    return SystemParametersInfoW_Original(action, param, pvParam, winIni);
+}
+
+static BOOL CALLBACK EnumSaveProc(HMONITOR mon, HDC, LPRECT, LPARAM) {
+    MONITORINFO mi = { sizeof(mi) };
+    if (GetMonitorInfoW(mon, &mi)) {
+        g_saved.push_back({ mon, mi.rcWork });
+    }
+    return TRUE;
+}
+
+static BOOL CALLBACK EnumApplyOnceProc(HMONITOR mon, HDC, LPRECT, LPARAM) {
+    MONITORINFO mi = { sizeof(mi) };
+    if (GetMonitorInfoW(mon, &mi) && !EqualRect(&mi.rcWork, &mi.rcMonitor)) {
+        RECT full = mi.rcMonitor;
+        SystemParametersInfoW_Original(SPI_SETWORKAREA, 0, &full, SPIF_SENDCHANGE);
+    }
+    return TRUE;
+}
+
+static DWORD WINAPI InitApplyThread(LPVOID) {
+    Sleep(500);
+    if (!g_unloading) {
+        EnumDisplayMonitors(nullptr, nullptr, EnumApplyOnceProc, 0);
+    }
+    return 0;
+}
+
+BOOL Wh_ModInit() {
+    g_saved.clear();
+    EnumDisplayMonitors(nullptr, nullptr, EnumSaveProc, 0);
+
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (!user32) return FALSE;
+
+    void* spiTarget = (void*)GetProcAddress(user32, "SystemParametersInfoW");
+    if (spiTarget) {
+        Wh_SetFunctionHook(spiTarget, (void*)SystemParametersInfoW_Hook,
+                           (void**)&SystemParametersInfoW_Original);
+    }
+
+    void* gmiTarget = (void*)GetProcAddress(user32, "GetMonitorInfoW");
+    if (gmiTarget) {
+        Wh_SetFunctionHook(gmiTarget, (void*)GetMonitorInfoW_Hook,
+                           (void**)&GetMonitorInfoW_Original);
+    }
+
+    g_initThread = CreateThread(nullptr, 0, InitApplyThread, nullptr, 0, nullptr);
+    return TRUE;
+}
+
+void Wh_ModUninit() {
+    InterlockedExchange(&g_unloading, 1);
+
+    if (g_initThread) {
+        WaitForSingleObject(g_initThread, 3000);
+        CloseHandle(g_initThread);
+        g_initThread = nullptr;
+    }
+
+    for (auto& s : g_saved) {
+        RECT r = s.originalWork;
+        if (SystemParametersInfoW_Original) {
+            SystemParametersInfoW_Original(SPI_SETWORKAREA, 0, &r, SPIF_SENDCHANGE);
+        }
+    }
+    g_saved.clear();
+}
