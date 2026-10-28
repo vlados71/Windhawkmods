@@ -2,12 +2,14 @@
 // @id            taskbar-overlay-workarea
 // @name          Taskbar Overlay by Vlad
 // @description   Makes maximized windows extend under the taskbar so a transparent taskbar draws over them
-// @version       0.4
+// @version       0.5
 // @author        Vlad
 // @include       explorer.exe
+// @compilerOptions -lole32 -loleaut32 -luuid
 // ==/WindhawkMod==
 
 #include <windows.h>
+#include <uiautomation.h>
 #include <vector>
 
 struct MonitorState {
@@ -17,7 +19,7 @@ struct MonitorState {
 
 static std::vector<MonitorState> g_saved;
 static volatile LONG g_unloading = 0;
-static HANDLE g_initThread = nullptr;
+static HANDLE g_workerThread = nullptr;
 
 typedef BOOL (WINAPI *SystemParametersInfoW_t)(UINT, UINT, PVOID, UINT);
 static SystemParametersInfoW_t SystemParametersInfoW_Original = nullptr;
@@ -63,10 +65,6 @@ static BOOL WINAPI SystemParametersInfoW_Hook(UINT action, UINT param, PVOID pvP
         MONITORINFO mi = { sizeof(mi) };
         
         if (GetMonitorInfoW_Original && GetMonitorInfoW_Original(mon, &mi)) {
-            
-            // DYNAMIC CACHE FIX: 
-            // If Explorer requests a work area smaller than the monitor, it is trying to 
-            // reserve taskbar space. We must update our saved spoof coordinates with this request.
             if (!EqualRect(in, &mi.rcMonitor)) {
                 for (auto& s : g_saved) {
                     if (s.monitor == mon) {
@@ -76,18 +74,15 @@ static BOOL WINAPI SystemParametersInfoW_Hook(UINT action, UINT param, PVOID pvP
                 }
             }
 
-            // If the actual OS work area is already full, we just return TRUE to break the loop.
             if (EqualRect(&mi.rcWork, &mi.rcMonitor)) {
                 return TRUE;
             }
             
-            // Otherwise, rewrite the request to full-screen.
             RECT full = mi.rcMonitor;
             return SystemParametersInfoW_Original(action, param, &full, winIni);
         }
     }
     
-    // Pass through any other calls normally
     return SystemParametersInfoW_Original(action, param, pvParam, winIni);
 }
 
@@ -108,11 +103,128 @@ static BOOL CALLBACK EnumApplyOnceProc(HMONITOR mon, HDC, LPRECT, LPARAM) {
     return TRUE;
 }
 
-static DWORD WINAPI InitApplyThread(LPVOID) {
-    Sleep(500);
-    if (!g_unloading) {
-        EnumDisplayMonitors(nullptr, nullptr, EnumApplyOnceProc, 0);
+static void SetTaskbarClickThrough(HWND hTaskbar, bool clickThrough) {
+    if (!hTaskbar || !IsWindow(hTaskbar)) return;
+    LONG_PTR exStyle = GetWindowLongPtrW(hTaskbar, GWL_EXSTYLE);
+    bool isCurrentlyTransparent = (exStyle & WS_EX_TRANSPARENT) != 0;
+
+    if (clickThrough && !isCurrentlyTransparent) {
+        SetWindowLongPtrW(hTaskbar, GWL_EXSTYLE, exStyle | WS_EX_LAYERED | WS_EX_TRANSPARENT);
+    } else if (!clickThrough && isCurrentlyTransparent) {
+        SetWindowLongPtrW(hTaskbar, GWL_EXSTYLE, exStyle & ~WS_EX_TRANSPARENT);
     }
+}
+
+// Collects the bounding rectangles of all interactive taskbar buttons and the system tray
+static void CollectInteractiveRects(IUIAutomation* pAutomation, HWND hTaskbar, std::vector<RECT>& outRects) {
+    outRects.clear();
+    if (!hTaskbar || !IsWindow(hTaskbar)) return;
+
+    RECT rcTaskbar = {0};
+    GetWindowRect(hTaskbar, &rcTaskbar);
+    int taskbarWidth = rcTaskbar.right - rcTaskbar.left;
+
+    // 1. Always include the classic TrayNotifyWnd bounds (Right-side system tray)
+    HWND hTrayNotify = FindWindowExW(hTaskbar, nullptr, L"TrayNotifyWnd", nullptr);
+    if (hTrayNotify && IsWindowVisible(hTrayNotify)) {
+        RECT rcTray = {0};
+        if (GetWindowRect(hTrayNotify, &rcTray) && (rcTray.right > rcTray.left)) {
+            InflateRect(&rcTray, 6, 6);
+            outRects.push_back(rcTray);
+        }
+    }
+
+    // 2. Query UI Automation for all individual taskbar buttons/icons/widgets
+    if (!pAutomation) return;
+
+    IUIAutomationElement* pRoot = nullptr;
+    if (SUCCEEDED(pAutomation->ElementFromHandle(hTaskbar, &pRoot)) && pRoot) {
+        IUIAutomationCondition* pTrueCond = nullptr;
+        if (SUCCEEDED(pAutomation->CreateTrueCondition(&pTrueCond)) && pTrueCond) {
+            IUIAutomationElementArray* pArr = nullptr;
+            if (SUCCEEDED(pRoot->FindAll(TreeScope_Descendants, pTrueCond, &pArr)) && pArr) {
+                int length = 0;
+                pArr->get_Length(&length);
+                for (int i = 0; i < length; ++i) {
+                    IUIAutomationElement* pElem = nullptr;
+                    if (SUCCEEDED(pArr->GetElement(i, &pElem)) && pElem) {
+                        RECT rc = {0};
+                        if (SUCCEEDED(pElem->get_CurrentBoundingRectangle(&rc))) {
+                            int w = rc.right - rc.left;
+                            int h = rc.bottom - rc.top;
+                            // Filter out full-width background containers; keep icons, buttons, and islands
+                            if (w > 4 && w < (taskbarWidth / 2) && h > 4 && h <= 120) {
+                                InflateRect(&rc, 6, 6); // Pad slightly to bridge gaps between icons
+                                outRects.push_back(rc);
+                            }
+                        }
+                        pElem->Release();
+                    }
+                }
+                pArr->Release();
+            }
+            pTrueCond->Release();
+        }
+        pRoot->Release();
+    }
+}
+
+static DWORD WINAPI WorkerThread(LPVOID) {
+    Sleep(500);
+    if (g_unloading) return 0;
+
+    EnumDisplayMonitors(nullptr, nullptr, EnumApplyOnceProc, 0);
+
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    IUIAutomation* pAutomation = nullptr;
+    CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER,
+                     __uuidof(IUIAutomation), (void**)&pAutomation);
+
+    std::vector<RECT> interactiveRects;
+    DWORD lastRefreshTick = 0;
+
+    while (!g_unloading) {
+        HWND hTaskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+        if (hTaskbar) {
+            RECT rcTaskbar = {0};
+            GetWindowRect(hTaskbar, &rcTaskbar);
+
+            POINT pt = {0, 0};
+            GetCursorPos(&pt);
+
+            // Only run hit-test logic when the cursor is near the taskbar vertically
+            RECT rcCheckZone = rcTaskbar;
+            InflateRect(&rcCheckZone, 10, 15);
+
+            if (PtInRect(&rcCheckZone, pt)) {
+                DWORD now = GetTickCount();
+                if (now - lastRefreshTick > 300 || interactiveRects.empty()) {
+                    CollectInteractiveRects(pAutomation, hTaskbar, interactiveRects);
+                    lastRefreshTick = now;
+                }
+
+                bool overInteractive = false;
+                for (const auto& r : interactiveRects) {
+                    if (PtInRect(&r, pt)) {
+                        overInteractive = true;
+                        break;
+                    }
+                }
+
+                // If cursor is in the empty gap, make taskbar click-through
+                SetTaskbarClickThrough(hTaskbar, !overInteractive);
+            } else {
+                // Keep taskbar normal when cursor is away so hotkeys/win-key work seamlessly
+                SetTaskbarClickThrough(hTaskbar, false);
+            }
+        }
+        Sleep(15);
+    }
+
+    if (pAutomation) {
+        pAutomation->Release();
+    }
+    CoUninitialize();
     return 0;
 }
 
@@ -135,17 +247,23 @@ BOOL Wh_ModInit() {
                            (void**)&GetMonitorInfoW_Original);
     }
 
-    g_initThread = CreateThread(nullptr, 0, InitApplyThread, nullptr, 0, nullptr);
+    g_workerThread = CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
     return TRUE;
 }
 
 void Wh_ModUninit() {
     InterlockedExchange(&g_unloading, 1);
 
-    if (g_initThread) {
-        WaitForSingleObject(g_initThread, 3000);
-        CloseHandle(g_initThread);
-        g_initThread = nullptr;
+    if (g_workerThread) {
+        WaitForSingleObject(g_workerThread, 3000);
+        CloseHandle(g_workerThread);
+        g_workerThread = nullptr;
+    }
+
+    // Restore normal taskbar clickability
+    HWND hTaskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (hTaskbar) {
+        SetTaskbarClickThrough(hTaskbar, false);
     }
 
     for (auto& s : g_saved) {
